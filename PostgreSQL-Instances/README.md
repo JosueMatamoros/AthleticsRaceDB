@@ -18,3 +18,5 @@
 chmod 700 PhysicalRep/
 ```
 
+# Logical Rep
+* Port: 5442
