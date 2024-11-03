@@ -231,3 +231,126 @@ SELECT * FROM Patrocinador
 SELECT obtener_historial_participante(1);
 SELECT obtener_patrocinadores_carrera(1);
 SELECT * FROM obtener_mensajes_chat(1, 2);
+
+SELECT * FROM pg_available_extensions WHERE name = 'pg_cron';
+CREATE EXTENSION IF NOT EXISTS pg_cron;
+
+-- Creacion de los Jobs 
+-- Primer JOB: Job de Sincronización y Limpieza de Mensajes de Chat
+CREATE TABLE LogLimpiezaMensajes (
+    id SERIAL PRIMARY KEY,
+    fecha TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    mensajes_eliminados INT,
+    descripcion VARCHAR(255)
+);
+
+CREATE OR REPLACE FUNCTION limpiar_mensajes_antiguos()
+RETURNS VOID AS $$
+DECLARE
+    mensajes_eliminados INT;
+BEGIN
+    DELETE FROM Mensaje
+    WHERE fecha < NOW() - INTERVAL '30 days'
+    RETURNING id INTO mensajes_eliminados;
+
+    INSERT INTO LogLimpiezaMensajes (mensajes_eliminados, descripcion)
+    VALUES (mensajes_eliminados, 'Limpieza exitosa de mensajes antiguos');
+
+    RAISE NOTICE 'Se han eliminado % mensajes antiguos.', mensajes_eliminados;
+EXCEPTION
+    WHEN OTHERS THEN
+        INSERT INTO LogLimpiezaMensajes (mensajes_eliminados, descripcion)
+        VALUES (NULL, 'Error al intentar eliminar mensajes: ' || SQLERRM);
+        RAISE WARNING 'Error al intentar eliminar mensajes antiguos: %', SQLERRM;
+END;
+$$ LANGUAGE plpgsql;
+
+SELECT cron.schedule(
+    'limpiar_mensajes_antiguos_job',
+    '0 0 * * *',  -- Se ejecuta a medianoche todos los días
+    'SELECT limpiar_mensajes_antiguos();'
+);
+
+-- Segundo JOB: Job de Actualización de Estadísticas de Carreras 
+-- Como tal se tenia que hacer en el servidor secundario, pero se hace en el primario para 
+-- que se propague al secundario
+CREATE TABLE EstadisticasCarreras (
+    carrera_id INT PRIMARY KEY,
+    total_participantes INT NOT NULL,
+    tiempo_promedio INTERVAL NOT NULL
+);
+
+CREATE TABLE JobLog (
+    id SERIAL PRIMARY KEY,
+    fecha TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    carrera_id INT,
+    mensaje TEXT NOT NULL
+);
+
+CREATE OR REPLACE FUNCTION actualizar_estadisticas_carreras()
+RETURNS VOID AS $$
+DECLARE
+    rec RECORD;
+BEGIN
+    FOR rec IN
+        SELECT carrera, COUNT(participante) AS total_participantes, AVG(duracion) AS tiempo_promedio
+        FROM ParticipanteStats
+        GROUP BY carrera
+    LOOP
+        BEGIN
+            INSERT INTO EstadisticasCarreras (carrera_id, total_participantes, tiempo_promedio)
+            VALUES (rec.carrera, rec.total_participantes, rec.tiempo_promedio)
+            ON CONFLICT (carrera_id) DO UPDATE
+            SET total_participantes = EXCLUDED.total_participantes,
+                tiempo_promedio = EXCLUDED.tiempo_promedio;
+
+            INSERT INTO JobLog (fecha, carrera_id, mensaje)
+            VALUES (NOW(), rec.carrera, 'Estadísticas actualizadas correctamente');
+        EXCEPTION WHEN OTHERS THEN
+            INSERT INTO JobLog (fecha, carrera_id, mensaje)
+            VALUES (NOW(), rec.carrera, 'Error al actualizar estadísticas: ' || SQLERRM);
+        END;
+    END LOOP;
+END;
+$$ LANGUAGE plpgsql;
+
+SELECT cron.schedule(
+    'Actualizacion de Estadisticas de Carreras',
+    '0 0 * * 0',  -- Todos los domingos a medianoche
+    $$
+    SELECT actualizar_estadisticas_carreras();
+    $$
+);
+
+-- Tercer JOB: 
+CREATE EXTENSION IF NOT EXISTS dblink;
+CREATE OR REPLACE FUNCTION sync_patrocinadores_y_premios()
+RETURNS VOID AS $$
+BEGIN
+    PERFORM dblink_exec(
+        'host=localhost port=5434 dbname=athleticrace user=rol_replica_logica password=1234',
+        'INSERT INTO Patrocinador (id, nombre)
+         SELECT id, nombre FROM Patrocinador
+         ON CONFLICT (id) DO UPDATE SET nombre = EXCLUDED.nombre;'
+    );
+
+    PERFORM dblink_exec(
+        'host=localhost port=5434 dbname=athleticrace user=rol_replica_logica password=1234',
+        'INSERT INTO Premio (id, descripcion, patrocinador_id, carrera_id)
+         SELECT id, descripcion, patrocinador_id, carrera_id FROM Premio
+         ON CONFLICT (id) DO UPDATE SET
+         descripcion = EXCLUDED.descripcion,
+         patrocinador_id = EXCLUDED.patrocinador_id,
+         carrera_id = EXCLUDED.carrera_id;'
+    );
+END;
+$$ LANGUAGE plpgsql;
+
+SELECT cron.schedule(
+    'sync_patrocinadores_y_premios_job',
+    '0 */6 * * *',
+    'SELECT sync_patrocinadores_y_premios();'
+);
+
+SELECT jobid, schedule, jobname
+FROM cron.job;
